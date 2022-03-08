@@ -30,6 +30,7 @@ contract FantohmTwapOracle is Ownable, AccessControl {
     mapping(address => Observation) oracle;
 
     constructor() {
+        _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _setupRole(OPERATOR_ROLE, msg.sender);
         _setupRole(UPDATER_ROLE, msg.sender);
     }

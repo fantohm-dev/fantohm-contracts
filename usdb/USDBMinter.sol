@@ -27,26 +27,38 @@ interface IUniswapV2Pair is IUniswapV2ERC20 {
     function token1() external view returns ( address );
 }
 
-contract FHUDMinter is Ownable, AccessControl {
+contract USDBMinter is Ownable, AccessControl {
     using SafeMath for uint256;
 
     bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
 
     address public fhmAddress;
+    address public usdbAddress;
     address public fhudAddress;
 
     address public fhmLpAddress;
     uint256 public decimals;
     bool public doDiv;
 
-    event FHUDMinted(
+    mapping(address => bool) mintByFhudWhitelist;
+    bool mintByFhudWhitelistEnabled;
+
+    event USDBMintedFromFHM(
         uint256 timestamp,
         address minter,
         uint256 fhmAmountBurnt,
-        uint256 fhudAmountMinted
+        uint256 usdbAmountMinted
+    );
+
+    event USDBMintedFromFHUD(
+        uint256 timestamp,
+        address minter,
+        uint256 fhudAmountBurnt,
+        uint256 usdbAmountMinted
     );
 
     constructor() {
+        mintByFhudWhitelistEnabled = true;
         _setupRole(DEFAULT_ADMIN_ROLE, _msgSender());
         _setupRole(MINTER_ROLE, _msgSender());
     }
@@ -65,8 +77,8 @@ contract FHUDMinter is Ownable, AccessControl {
         }
     }
 
-    function getFhmAmount(uint256 stableCoinAmount, uint256 marketPrice) public view returns (uint256) {
-        return stableCoinAmount.div(marketPrice.div(10**2)).div(10**9);
+    function getFhmAmount(uint256 _stableCoinAmount, uint256 _marketPrice) public view returns (uint256) {
+        return _stableCoinAmount.div(_marketPrice.div(10**2)).div(10**9);
     }
 
     /**
@@ -75,26 +87,53 @@ contract FHUDMinter is Ownable, AccessControl {
      */
     // 10,000 usd / 100.00 usd/fhm
     // 10,000.000,000,000,000,000,000 / 100.00
-    function mint(uint256 stableCoinAmount, uint256 minimalTokenPrice) external virtual {
-        require(hasRole(MINTER_ROLE, _msgSender()), "FHUDMinter: must have minter role to mint");
+    function mintFromFHM(uint256 _stableCoinAmount, uint256 _minimalTokenPrice) external {
+        require(hasRole(MINTER_ROLE, _msgSender()), "MINTER_ROLE_MISSING");
 
         uint256 marketPrice = getMarketPrice();
-        require(marketPrice >= minimalTokenPrice, "Slip page not met");
+        require(marketPrice >= _minimalTokenPrice, "SLIPPAGE_NOT_MET");
 
-        uint256 fhmAmount = getFhmAmount(stableCoinAmount, marketPrice);
+        uint256 fhmAmount = getFhmAmount(_stableCoinAmount, marketPrice);
         IBurnable(fhmAddress).burnFrom(msg.sender, fhmAmount);
-        IMintable(fhudAddress).mint(msg.sender, stableCoinAmount);
+        IMintable(usdbAddress).mint(msg.sender, _stableCoinAmount);
 
-        emit FHUDMinted(block.timestamp, msg.sender, fhmAmount, stableCoinAmount);
+        emit USDBMintedFromFHM(block.timestamp, msg.sender, fhmAmount, _stableCoinAmount);
+    }
 
+    function mintFromFHUD(uint _fhudAmount) external {
+        if (mintByFhudWhitelistEnabled) {
+            require(mintByFhudWhitelist[msg.sender], "MISSING_IN_WHITELIST");
+        }
+        IBurnable(fhudAddress).burnFrom(msg.sender, _fhudAmount);
+        IMintable(usdbAddress).mint(msg.sender, _fhudAmount);
+
+        emit USDBMintedFromFHUD(block.timestamp, msg.sender, _fhudAmount, _fhudAmount);
     }
 
     function setFhmAddress(address _fhmAddress) external virtual onlyOwner {
         fhmAddress = _fhmAddress;
     }
 
+    function setUsdbAddress(address _usdbAddress) external virtual onlyOwner {
+        usdbAddress = _usdbAddress;
+    }
+
     function setFhudAddress(address _fhudAddress) external virtual onlyOwner {
         fhudAddress = _fhudAddress;
+    }
+
+    function setMintByFhudEnabled(bool _mintByFhudWhitelistEnabled) external virtual onlyOwner {
+        mintByFhudWhitelistEnabled = _mintByFhudWhitelistEnabled;
+    }
+
+    function modifyWhitelist(address user, bool add) external onlyOwner {
+        if (add) {
+            require(!mintByFhudWhitelist[user], "ALREADY_IN_WHITELIST");
+            mintByFhudWhitelist[user] = true;
+        } else {
+            require(mintByFhudWhitelist[user], "NOT_IN_WHITELIST");
+            delete mintByFhudWhitelist[user];
+        }
     }
 
     function setFhmLpAddress(address _fhmLpAddress, uint256 _decimals, bool _doDiv) external virtual onlyOwner {
@@ -103,12 +142,24 @@ contract FHUDMinter is Ownable, AccessControl {
         doDiv = _doDiv;
     }
 
-    function recoverTokens(address token) external virtual onlyOwner {
-        IERC20(token).transfer(owner(), IERC20(token).balanceOf(address(this)));
+    function recoverTokens(address _token) external virtual onlyOwner {
+        IERC20(_token).transfer(owner(), IERC20(_token).balanceOf(address(this)));
     }
 
     function recoverEth() external virtual onlyOwner {
         payable(owner()).transfer(address(this).balance);
+    }
+
+    /// @notice grants minter role to given _account
+    /// @param _account minter contract
+    function grantRoleMinter(address _account) external {
+        grantRole(MINTER_ROLE, _account);
+    }
+
+    /// @notice revoke minter role to given _account
+    /// @param _account minter contract
+    function revokeRoleMinter(address _account) external {
+        revokeRole(MINTER_ROLE, _account);
     }
 
 }
