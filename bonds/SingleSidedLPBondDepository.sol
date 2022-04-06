@@ -897,6 +897,7 @@ contract SingleSidedLPBondDepository is Ownable, ReentrancyGuard {
     uint public lastDecay; // reference block for debt decay
     uint public dustRounding;
     uint public ilProtectionMaxCapInUsd;
+    uint public ilProtectionFullProtectionInDays;
 
     bool public useWhitelist;
     bool public useCircuitBreaker;
@@ -972,6 +973,7 @@ contract SingleSidedLPBondDepository is Ownable, ReentrancyGuard {
         useWhitelist = true;
         whitelist[msg.sender] = true;
         dustRounding = 1;
+        ilProtectionFullProtectionInDays = 100;
 
         IERC20(_principle).approve(_balancerVault, max);
         IERC20(_USDB).approve(_balancerVault, max);
@@ -1203,6 +1205,7 @@ contract SingleSidedLPBondDepository is Ownable, ReentrancyGuard {
      *  @return uint amount in dai really claimed
      */
     function redeem(address _recipient, uint _amount, uint _amountMin) external nonReentrant returns (uint) {
+        require(_recipient == msg.sender, "CALL_FORBIDDEN");
         // due to integer math there needs to be some dusting which is still considered as full withdraw
         _amount = _amount.sub(dustRounding);
 
@@ -1230,6 +1233,12 @@ contract SingleSidedLPBondDepository is Ownable, ReentrancyGuard {
             info.ilProtectionUnlockBlock = block.number + terms.ilProtectionRewardsVestingBlocks;
         }
 
+        uint toSendToDao = 0;
+        if (_principleAmount > info.payout) {
+            toSendToDao = _principleAmount.sub(info.payout);
+            _principleAmount = info.payout;
+        }
+
         if (_principleAmount < info.payout) {
             info.payout = info.payout.sub(_principleAmount);
         } else {
@@ -1248,6 +1257,9 @@ contract SingleSidedLPBondDepository is Ownable, ReentrancyGuard {
 
         IBurnable(USDB).burn(_usdbAmount);
         IERC20(principle).transfer(_recipient, _principleAmount);
+        if (toSendToDao > 0) {
+            IERC20(principle).transfer(DAO, toSendToDao);
+        }
 
         return _principleAmount;
     }
@@ -1298,6 +1310,9 @@ contract SingleSidedLPBondDepository is Ownable, ReentrancyGuard {
             ilInPrinciple = info.payout.sub(_principleAmount);
         }
         uint claimable = ilInPrinciple.mul(uint(assetPrice())).div(1e8); // 8 decimals feed
+        // full IL protection after 100 days,
+        uint daysStaking = (block.number - info.lastBlock) / (24 * 60 * 60);
+        claimable = Math.min(claimable, claimable.mul(daysStaking).div(ilProtectionFullProtectionInDays));
 
         if (claimable < terms.ilProtectionMinimalLossInUsd) return 0;
         else if (claimable >= ilProtectionMaxCapInUsd) return ilProtectionMaxCapInUsd;
@@ -1563,6 +1578,10 @@ contract SingleSidedLPBondDepository is Ownable, ReentrancyGuard {
 
     function setIlProtectionMaxCapInUsd(uint _ilProtectionMaxCapInUsd) external onlyPolicy {
         ilProtectionMaxCapInUsd = _ilProtectionMaxCapInUsd;
+    }
+
+    function setIlProtectionFullProtectionInDays(uint _ilProtectionFullProtectionInDays) external onlyPolicy {
+        ilProtectionFullProtectionInDays = _ilProtectionFullProtectionInDays;
     }
 
 
