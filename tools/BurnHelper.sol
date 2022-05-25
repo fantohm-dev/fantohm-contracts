@@ -95,10 +95,10 @@ contract BurnHelperV3 is Ownable, AccessControl {
 
     bool public useCircuitBreaker;
     SoldBonds[] public buybacksInHour;
-    SoldBonds[] public usdbMintsInHour;
 
     uint buybacksLimitUsd;
-    uint usdbMintsLimitUsd;
+
+    uint public totalFhmBurnt;
 
     ///
     /// events
@@ -141,6 +141,20 @@ contract BurnHelperV3 is Ownable, AccessControl {
         IERC20(_USDB).approve(_treasury, max);
     }
 
+    /// @notice set initial fhm burnt from previous contract
+    /// @param _totalFhmBurnt previous value
+    function setTotalFhmBurnt(uint _totalFhmBurnt) external onlyOwner {
+        totalFhmBurnt = _totalFhmBurnt;
+    }
+
+    /// @notice set buyback limit from usd
+    /// @param _useCircuitBreaker whether use circuit breaker
+    /// @param _buybacksLimitUsd buyback limit for 24 hours from treasury
+    function setUseCircuitBreakerBuybacksLimitUsd(bool _useCircuitBreaker, uint _buybacksLimitUsd) external onlyOwner {
+        useCircuitBreaker = _useCircuitBreaker;
+        buybacksLimitUsd = _buybacksLimitUsd;
+    }
+
     /// @notice grants manager role to given _account
     /// @param _account manager contract
     function grantRoleManager(address _account) external {
@@ -158,6 +172,7 @@ contract BurnHelperV3 is Ownable, AccessControl {
     ///
 
     /// @notice convenient method how to burn wrapped token from gnosis
+    /// @param _rawBurn true if burn to 0x0 or false to burn into usdb
     function burnAllWrappedTokens(bool _rawBurn) external {
         uint balance = wsFHM.balanceOf(msg.sender);
         wsFHM.transferFrom(msg.sender, address(this), balance);
@@ -165,29 +180,23 @@ contract BurnHelperV3 is Ownable, AccessControl {
         wsFHM.unwrap(balance);
         staking.unstake(sFHM.balanceOf(address(this)), true);
 
-        if (_rawBurn) {
-            burn();
-        } else {
-            burnIntoUsdb();
-        }
+        burnAllNativeTokens(_rawBurn);
     }
 
     /// @notice convenient method how to burn staked token from gnosis
+    /// @param _rawBurn true if burn to 0x0 or false to burn into usdb
     function burnAllStakedTokens(bool _rawBurn) external {
         uint balance = sFHM.balanceOf(msg.sender);
         sFHM.transferFrom(msg.sender, address(this), balance);
 
         IStaking(staking).unstake(balance, true);
 
-        if (_rawBurn) {
-            burn();
-        } else {
-            burnIntoUsdb();
-        }
+        burnAllNativeTokens(_rawBurn);
     }
 
     /// @notice convenient method how to burn native token from gnosis
-    function burnAllNativeTokens(bool _rawBurn) external {
+    /// @param _rawBurn true if burn to 0x0 or false to burn into usdb
+    function burnAllNativeTokens(bool _rawBurn) public {
         if (_rawBurn) {
             burn();
         } else {
@@ -196,13 +205,8 @@ contract BurnHelperV3 is Ownable, AccessControl {
     }
 
     function burn() internal {
-        uint marketPrice = usdbMinter.getMarketPrice();
         uint fhmAmount = FHM.balanceOf(address(this));
-        uint usdbAmount = fhmAmount.mul(marketPrice).div(1e2);
-
-        require(!buybacksCircuitBreakerActivated(usdbAmount), "CIRCUIT_BREAKER_ACTIVE");
-        if (useCircuitBreaker) updateSoldBonds(buybacksInHour, usdbAmount);
-
+        totalFhmBurnt = totalFhmBurnt.add(fhmAmount);
         FHM.burn(fhmAmount);
     }
 
@@ -211,9 +215,7 @@ contract BurnHelperV3 is Ownable, AccessControl {
         uint fhmAmount = FHM.balanceOf(address(this));
         uint usdbAmount = fhmAmount.mul(marketPrice).div(1e2);
 
-        require(!usdbMintsCircuitBreakerActivated(usdbAmount), "CIRCUIT_BREAKER_ACTIVE");
-        if (useCircuitBreaker) updateSoldBonds(usdbMintsInHour, usdbAmount);
-
+        totalFhmBurnt = totalFhmBurnt.add(fhmAmount);
         usdbMinter.mintFromFHM(usdbAmount, marketPrice);
 
         // deposit into treasury without generating any profit
@@ -225,32 +227,51 @@ contract BurnHelperV3 is Ownable, AccessControl {
     /// buybacks
     ///
 
-
-    function buybackAndBurn(uint _daiAmountWithoutDecimals, uint _slipPageWith1Decimal, bool _rawBurn) external {
-        require(hasRole(MANAGER_ROLE, msg.sender), "MISSING_MANAGER_ROLE");
-
-        // manage LP token
-        treasury.manage(address(DAI), _daiAmountWithoutDecimals * 1e18);
-
-        if (_slipPageWith1Decimal == 0) {
-            // default slip page same as in spookyswap
-            _slipPageWith1Decimal = 8;
-        }
-
-        uint daiAmount = DAI.balanceOf(address(this));
-
+    /// @notice get min amount out for given amount in and slippage
+    /// @param _daiAmountWithoutDecimals amount in
+    /// @param _slipPageWith1Decimal slippage, default is 0
+    /// @return _fhmAmount min amount out
+    function getAmountOut(uint _daiAmountWithoutDecimals, uint _slipPageWith1Decimal) external view returns (uint _fhmAmount) {
         (uint reserveA, uint reserveB) = getReserves(lp, address(DAI), address(FHM));
-        uint fhmAmount = getAmountOut(daiAmount, reserveA, reserveB);
-
-        swapTokensForTokens(daiAmount, fhmAmount.mul(uint(1000).sub(_slipPageWith1Decimal)).div(1000));
-
-        if (_rawBurn) {
-            burn();
-        } else {
-            burnIntoUsdb();
-        }
+        uint fhmAmount = getAmountOut(_daiAmountWithoutDecimals.mul(10 ** 18), reserveA, reserveB);
+        _fhmAmount = fhmAmount.mul(uint(1000).sub(_slipPageWith1Decimal)).div(1000);
     }
 
+    /// @notice buyback and burn from treasury
+    /// @param _daiAmountWithoutDecimals dai amount without any decimal, so 1000 is 1000 dai
+    /// @param _minFhmAmount min fhm amount we can receive
+    /// @param _rawBurn true if burn to 0x0 or false to burn into usdb
+    function buybackAndBurnFromTreasury(uint _daiAmountWithoutDecimals, uint _minFhmAmount, bool _rawBurn) external {
+        require(hasRole(MANAGER_ROLE, msg.sender), "MISSING_MANAGER_ROLE");
+
+        uint daiAmount = _daiAmountWithoutDecimals.mul(1e18);
+        require(!circuitBreakerActivated(daiAmount), "CIRCUIT_BREAKER_ACTIVE");
+        if (useCircuitBreaker) updateSoldBonds(buybacksInHour, daiAmount);
+
+
+        // manage LP token
+        treasury.manage(address(DAI), daiAmount);
+
+        // swap dai for fhm
+        swapTokensForTokens(DAI.balanceOf(address(this)), _minFhmAmount);
+
+        // burn fhm
+        burnAllNativeTokens(_rawBurn);
+    }
+
+    /// @notice buyback and burn from callers pocket
+    /// @param _daiAmountWithoutDecimals dai amount without any decimal, so 1000 is 1000 dai
+    /// @param _minFhmAmount min fhm amount we can receive
+    function buybackAndBurnManual(uint _daiAmountWithoutDecimals, uint _minFhmAmount) external {
+        // transfer wanted dai
+        IERC20(DAI).transferFrom(msg.sender, address(this), _daiAmountWithoutDecimals.mul(1e18));
+
+        // swap dai for fhm
+        swapTokensForTokens(IERC20(DAI).balanceOf(address(this)), _minFhmAmount);
+
+        // burn fhm into 0x0
+        burn();
+    }
 
     function updateSoldBonds(SoldBonds[] storage soldBondsInHour, uint _payout) internal {
         uint length = soldBondsInHour.length;
@@ -286,24 +307,16 @@ contract BurnHelperV3 is Ownable, AccessControl {
         }
     }
 
-    function buybacksCurrentPayout() public view returns (uint _amount) {
-        return soldBondsCurrentPayout(buybacksInHour);
-    }
-
-    function usdbMintsCurrentPayout() public view returns (uint _amount) {
-        return soldBondsCurrentPayout(usdbMintsInHour);
-    }
-
-    function soldBondsCurrentPayout(SoldBonds[] storage soldBondsInHour) internal view returns (uint _amount) {
-        if (soldBondsInHour.length == 0) return 0;
+    function currentPayout() internal view returns (uint _amount) {
+        if (buybacksInHour.length == 0) return 0;
 
         uint _max = 0;
-        if (soldBondsInHour.length >= 24) _max = soldBondsInHour.length - 24;
+        if (buybacksInHour.length >= 24) _max = buybacksInHour.length - 24;
 
         uint to = block.timestamp;
         uint from = to - 24 hours;
-        for (uint i = _max; i < soldBondsInHour.length; i++) {
-            SoldBonds memory soldBonds = soldBondsInHour[i];
+        for (uint i = _max; i < buybacksInHour.length; i++) {
+            SoldBonds memory soldBonds = buybacksInHour[i];
             if (soldBonds.timestampFrom >= from && soldBonds.timestampFrom <= to) {
                 _amount = _amount.add(soldBonds.payoutInUsd);
             }
@@ -312,16 +325,10 @@ contract BurnHelperV3 is Ownable, AccessControl {
         return _amount;
     }
 
-    function buybacksCircuitBreakerActivated(uint _payout) public view returns (bool) {
+    function circuitBreakerActivated(uint _payout) public view returns (bool) {
         if (!useCircuitBreaker) return false;
-        _payout = _payout.add(buybacksCurrentPayout());
+        _payout = _payout.add(currentPayout());
         return _payout > buybacksLimitUsd;
-    }
-
-    function usdbMintsCircuitBreakerActivated(uint _payout) public view returns (bool) {
-        if (!useCircuitBreaker) return false;
-        _payout = _payout.add(usdbMintsCurrentPayout());
-        return _payout > usdbMintsLimitUsd;
     }
 
     ///
